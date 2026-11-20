@@ -37,11 +37,11 @@ CUDA_VISIBLE_DEVICES=0,1 bash training/train.sh rgb3 plain_flow
 
 ## 小规模验证、断点与产物
 
-先在至少包含一个完整 16 帧窗口的训练集上做一步冒烟测试，运行目录与正式实验分开。模型仍会保存完整检查点和最终权重，请预留数十 GB 磁盘。原 317k 训练脚本按保留十个完整续训检查点预算 450 GB。
+先在至少包含一个完整 16 帧窗口的训练集上做一步冒烟测试，运行目录与正式实验分开。下面的分片参数用于本次实测的一条 1,709 帧头部相机 episode；更换短数据时应使分片大小与实际可用帧数匹配。模型仍会保存完整检查点和最终权重，请预留数十 GB 磁盘。原 317k 训练脚本按保留十个完整续训检查点预算 450 GB。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 NUM_GPUS=1 GLOBAL_BATCH_SIZE=1 ACCUMULATION_STEPS=1 \
-  MAX_STEPS=1 SAVE_STEPS=1 WORKERS=1 NUM_SHARDS_PER_EPOCH=2 \
+  MAX_STEPS=1 SAVE_STEPS=1 WORKERS=0 SHARD_SIZE=192 NUM_SHARDS_PER_EPOCH=2 \
   OUTPUT_DIR=outputs/smoke_head bash training/train.sh headrgb pir2
 
 python scripts/prepare_weights.py check checkpoint --path outputs/smoke_head/checkpoint-1
