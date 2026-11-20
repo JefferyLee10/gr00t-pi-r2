@@ -1,0 +1,377 @@
+--- pir2.py
++++ pir2.py
+@@ -60,13 +60,26 @@
+ TRAINED_IMAGE_DELAY_MAX = 5
+ 
+ # Safety gates inherited from the trusted RGB controller.
+-RAW_ARM_GATE_DEG = 70.0
+-MAX_PRED_STEP_JUMP_DEG = 15.0
++RAW_ARM_GATE_DEG = 30.0
++MAX_PRED_STEP_JUMP_DEG = 8.0
+ MAX_ARM_STEP_DEG = 15.0
+ MAX_ARM_STEP_RAD = np.deg2rad(MAX_ARM_STEP_DEG)
+ MAX_HAND_STEP_RAD = 1.0
+ MAX_CONSECUTIVE_REJECTS = 3
+ MAX_OBS_AGE_SEC = 0.15
++
++# Hand-arm synchronization interlock.
++#
++# When the policy is commanding a hand to close but the physical hand has
++# not caught up, temporarily HOLD only the corresponding arm while allowing
++# the hand and the πR² inference pipeline to continue normally.
++#
++# These are initial conservative real-robot values and can be tuned from CLI.
++DEFAULT_GRASP_LAG_ENTER_RAD = 0.12
++DEFAULT_GRASP_LAG_EXIT_RAD = 0.06
++DEFAULT_GRASP_CLOSE_DELTA = 0.05
++DEFAULT_GRASP_RELEASE_TICKS = 3
++DEFAULT_GRASP_HOLD_TIMEOUT_SEC = 1.0
+ 
+ 
+ # =============================================================================
+@@ -368,6 +381,220 @@
+     return cmd_la, cmd_ra, cmd_lh6, cmd_rh6, metrics
+ 
+ 
++
++# =============================================================================
++# Hand-arm grasp synchronization interlock
++# =============================================================================
++
++class GraspSyncInterlock:
++    """
++    Execution-layer synchronization between each physical hand and its arm.
++
++    Important:
++    - πR² inference NEVER stops.
++    - VLM cache update NEVER stops.
++    - DiT streaming NEVER stops.
++    - Hand command is NEVER replaced here.
++    - Existing hand/gripper mapping is NEVER changed.
++    - Only the corresponding arm command is temporarily replaced with
++      the current measured arm pose while the physical hand catches up.
++    """
++
++    def __init__(
++        self,
++        lag_enter_rad,
++        lag_exit_rad,
++        close_delta,
++        release_ticks,
++        hold_timeout_sec,
++    ):
++        if lag_exit_rad >= lag_enter_rad:
++            raise ValueError(
++                "grasp lag exit threshold must be smaller than enter threshold"
++            )
++        if release_ticks < 1:
++            raise ValueError("release_ticks must be >= 1")
++        if hold_timeout_sec <= 0:
++            raise ValueError("hold_timeout_sec must be > 0")
++
++        self.lag_enter_rad = float(lag_enter_rad)
++        self.lag_exit_rad = float(lag_exit_rad)
++        self.close_delta = float(close_delta)
++        self.release_ticks = int(release_ticks)
++        self.hold_timeout_sec = float(hold_timeout_sec)
++
++        self._state = {
++            "left": {
++                "hold": False,
++                "start": None,
++                "release_count": 0,
++            },
++            "right": {
++                "hold": False,
++                "start": None,
++                "release_count": 0,
++            },
++        }
++
++    def _apply_side(
++        self,
++        side,
++        pred_hand4,
++        obs,
++        cmd_arm,
++        now,
++        step,
++    ):
++        physical_hand = np.asarray(
++            obs[f"{side}_hand"],
++            dtype=np.float64,
++        ).reshape(6)
++
++        # Preserve exactly the same hand/gripper representation already
++        # validated by this deployment.
++        current_hand4 = base.compress_hand_6_to_4(physical_hand)
++
++        target_t = hand4_to_gripper_t(pred_hand4)
++        current_t = hand4_to_gripper_t(current_hand4)
++
++        target_hand6 = hand4_gripper_t_to_hand6(
++            pred_hand4,
++            target_t,
++        )
++
++        # Whole-hand lag, including h0/thumb and all projected fingers.
++        hand_lag = float(
++            np.max(np.abs(target_hand6 - physical_hand))
++        )
++
++        # In the existing gripper mapping, larger t means further toward
++        # the commanded closing configuration.
++        closing_gap = float(target_t - current_t)
++
++        st = self._state[side]
++        event = None
++
++        # ------------------------------------------------------------
++        # NORMAL -> GRASP_WAIT
++        # ------------------------------------------------------------
++        if not st["hold"]:
++            if (
++                closing_gap >= self.close_delta
++                and hand_lag >= self.lag_enter_rad
++            ):
++                st["hold"] = True
++                st["start"] = now
++                st["release_count"] = 0
++                event = "ENTER"
++
++        # ------------------------------------------------------------
++        # GRASP_WAIT
++        # ------------------------------------------------------------
++        if st["hold"]:
++            if hand_lag <= self.lag_exit_rad:
++                st["release_count"] += 1
++            else:
++                st["release_count"] = 0
++
++            if st["release_count"] >= self.release_ticks:
++                st["hold"] = False
++                st["start"] = None
++                st["release_count"] = 0
++                event = "EXIT"
++
++            elif (
++                st["start"] is not None
++                and now - st["start"] > self.hold_timeout_sec
++            ):
++                raise RuntimeError(
++                    f"Safety stop: {side} hand failed to catch up "
++                    f"within {self.hold_timeout_sec:.2f}s | "
++                    f"hand_lag={hand_lag:.3f}rad | "
++                    f"target_t={target_t:.3f} "
++                    f"current_t={current_t:.3f}"
++                )
++
++        if event is not None:
++            print(
++                f"[GRASP_SYNC] {side.upper()} {event} | "
++                f"lag={hand_lag:.3f}rad | "
++                f"target_t={target_t:.3f} "
++                f"current_t={current_t:.3f} "
++                f"closing_gap={closing_gap:.3f}",
++                flush=True,
++            )
++
++        # While waiting for the physical hand, keep the arm exactly at
++        # its current measured joint pose. The hand command remains untouched.
++        if st["hold"]:
++            cmd_arm = np.asarray(
++                obs[f"{side}_arm"],
++                dtype=np.float64,
++            ).copy()
++
++        info = {
++            "hold": bool(st["hold"]),
++            "hand_lag": hand_lag,
++            "target_t": float(target_t),
++            "current_t": float(current_t),
++            "closing_gap": closing_gap,
++        }
++
++        return cmd_arm, info
++
++    def apply(
++        self,
++        raw22,
++        obs,
++        cmd_la,
++        cmd_ra,
++        step,
++    ):
++        _, _, pred_lh4, pred_rh4 = split_action22(raw22)
++
++        now = time.monotonic()
++
++        cmd_la, left_info = self._apply_side(
++            "left",
++            pred_lh4,
++            obs,
++            cmd_la,
++            now,
++            step,
++        )
++
++        cmd_ra, right_info = self._apply_side(
++            "right",
++            pred_rh4,
++            obs,
++            cmd_ra,
++            now,
++            step,
++        )
++
++        if (
++            step % 20 == 0
++            and (left_info["hold"] or right_info["hold"])
++        ):
++            print(
++                "[GRASP_SYNC] HOLD | "
++                f"L={int(left_info['hold'])} "
++                f"lag={left_info['hand_lag']:.3f} "
++                f"t={left_info['current_t']:.3f}"
++                f"->{left_info['target_t']:.3f} | "
++                f"R={int(right_info['hold'])} "
++                f"lag={right_info['hand_lag']:.3f} "
++                f"t={right_info['current_t']:.3f}"
++                f"->{right_info['target_t']:.3f}",
++                flush=True,
++            )
++
++        return cmd_la, cmd_ra, {
++            "left": left_info,
++            "right": right_info,
++        }
++
++
+ # =============================================================================
+ # Main
+ # =============================================================================
+@@ -387,6 +614,38 @@
+     )
+     ap.add_argument("--nfe", type=int, default=DEFAULT_NFE)
+     ap.add_argument("--initial-d", type=int, default=DEFAULT_INITIAL_D)
++
++    ap.add_argument(
++        "--grasp-lag-enter",
++        type=float,
++        default=DEFAULT_GRASP_LAG_ENTER_RAD,
++        help="Enter arm HOLD when whole-hand tracking lag exceeds this value.",
++    )
++    ap.add_argument(
++        "--grasp-lag-exit",
++        type=float,
++        default=DEFAULT_GRASP_LAG_EXIT_RAD,
++        help="Release arm HOLD when whole-hand lag falls below this value.",
++    )
++    ap.add_argument(
++        "--grasp-close-delta",
++        type=float,
++        default=DEFAULT_GRASP_CLOSE_DELTA,
++        help="Minimum target-current gripper closing gap required to enter HOLD.",
++    )
++    ap.add_argument(
++        "--grasp-release-ticks",
++        type=int,
++        default=DEFAULT_GRASP_RELEASE_TICKS,
++        help="Consecutive caught-up ticks required before releasing arm HOLD.",
++    )
++    ap.add_argument(
++        "--grasp-hold-timeout",
++        type=float,
++        default=DEFAULT_GRASP_HOLD_TIMEOUT_SEC,
++        help="Maximum grasp HOLD time before safety stop.",
++    )
++
+     ap.add_argument("--robot-host", required=True, help="Bridge address, e.g. 10.0.0.11")
+     ap.add_argument("--robot-port", type=int, default=7788)
+     ap.add_argument("--vlm-host", default="127.0.0.1")
+@@ -394,11 +653,10 @@
+     ap.add_argument("--dit-host", default="127.0.0.1")
+     ap.add_argument("--dit-port", type=int, default=5556)
+     ap.add_argument("--task", default="快递分拣")
+-    ap.add_argument("--cameras", choices=("rgb3", "head"), default="rgb3")
++    ap.add_argument("--cameras", choices=("rgb3",), default="rgb3")
+     args = ap.parse_args()
+     if not np.isfinite(args.seconds) or args.seconds < 0 or args.nfe < 1:
+         ap.error("seconds must be finite and nonnegative, nfe must be positive")
+-    jump_gate = MAX_PRED_STEP_JUMP_DEG if args.cameras == "rgb3" else 8.0
+     cameras = base.CAMERAS if args.cameras == "rgb3" else ("head_rgb",)
+ 
+     if not (1 <= args.initial_d <= TRAINED_D_MAX):
+@@ -721,6 +979,23 @@
+     last_result_seq = 0
+     consecutive_rejects = 0
+ 
++    grasp_sync = GraspSyncInterlock(
++        lag_enter_rad=args.grasp_lag_enter,
++        lag_exit_rad=args.grasp_lag_exit,
++        close_delta=args.grasp_close_delta,
++        release_ticks=args.grasp_release_ticks,
++        hold_timeout_sec=args.grasp_hold_timeout,
++    )
++
++    print(
++        "[GRASP_SYNC] enabled | "
++        f"enter={args.grasp_lag_enter:.3f}rad "
++        f"exit={args.grasp_lag_exit:.3f}rad "
++        f"close_delta={args.grasp_close_delta:.3f} "
++        f"release_ticks={args.grasp_release_ticks} "
++        f"timeout={args.grasp_hold_timeout:.2f}s"
++    )
++
+     print("\n[5] workers started")
+     print(f"initial emit window = [{chunk_idx}, {swap_target})")
+     print("\n[6] 20 Hz controller started")
+@@ -798,7 +1073,7 @@
+                     raw22 = prev_raw22.copy()
+                     try:
+                         cmd_la, cmd_ra, cmd_lh6, cmd_rh6, metrics = safe_physical_action(
+-                            raw22, None, obs, jump_gate
++                            raw22, None, obs
+                         )
+                     except ValueError as e:
+                         consecutive_rejects += 1
+@@ -811,6 +1086,15 @@
+                         continue
+ 
+                     consecutive_rejects = 0
++
++                    cmd_la, cmd_ra, _sync_info = grasp_sync.apply(
++                        raw22,
++                        obs,
++                        cmd_la,
++                        cmd_ra,
++                        step,
++                    )
++
+                     if args.send:
+                         rpc = base.send_targets(
+                             cmd_proxy,
+@@ -864,7 +1148,7 @@
+ 
+             try:
+                 cmd_la, cmd_ra, cmd_lh6, cmd_rh6, metrics = safe_physical_action(
+-                    raw22, prev_raw22, obs, jump_gate
++                    raw22, prev_raw22, obs
+                 )
+             except ValueError as e:
+ 
+@@ -902,6 +1186,14 @@
+                 continue
+ 
+             consecutive_rejects = 0
++
++            cmd_la, cmd_ra, _sync_info = grasp_sync.apply(
++                raw22,
++                obs,
++                cmd_la,
++                cmd_ra,
++                step,
++            )
+ 
+             if args.send:
+                 rpc = base.send_targets(

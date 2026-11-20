@@ -1,0 +1,48 @@
+--- pir2.py
++++ pir2.py
+@@ -60,12 +60,12 @@
+ TRAINED_IMAGE_DELAY_MAX = 5
+ 
+ # Safety gates inherited from the trusted RGB controller.
+-RAW_ARM_GATE_DEG = 70.0
++RAW_ARM_GATE_DEG = 70
+ MAX_PRED_STEP_JUMP_DEG = 15.0
+ MAX_ARM_STEP_DEG = 15.0
+ MAX_ARM_STEP_RAD = np.deg2rad(MAX_ARM_STEP_DEG)
+ MAX_HAND_STEP_RAD = 1.0
+-MAX_CONSECUTIVE_REJECTS = 3
++MAX_CONSECUTIVE_REJECTS = 5
+ MAX_OBS_AGE_SEC = 0.15
+ 
+ 
+@@ -394,11 +394,10 @@
+     ap.add_argument("--dit-host", default="127.0.0.1")
+     ap.add_argument("--dit-port", type=int, default=5556)
+     ap.add_argument("--task", default="快递分拣")
+-    ap.add_argument("--cameras", choices=("rgb3", "head"), default="rgb3")
++    ap.add_argument("--cameras", choices=("rgb3",), default="rgb3")
+     args = ap.parse_args()
+     if not np.isfinite(args.seconds) or args.seconds < 0 or args.nfe < 1:
+         ap.error("seconds must be finite and nonnegative, nfe must be positive")
+-    jump_gate = MAX_PRED_STEP_JUMP_DEG if args.cameras == "rgb3" else 8.0
+     cameras = base.CAMERAS if args.cameras == "rgb3" else ("head_rgb",)
+ 
+     if not (1 <= args.initial_d <= TRAINED_D_MAX):
+@@ -798,7 +797,7 @@
+                     raw22 = prev_raw22.copy()
+                     try:
+                         cmd_la, cmd_ra, cmd_lh6, cmd_rh6, metrics = safe_physical_action(
+-                            raw22, None, obs, jump_gate
++                            raw22, None, obs
+                         )
+                     except ValueError as e:
+                         consecutive_rejects += 1
+@@ -864,7 +863,7 @@
+ 
+             try:
+                 cmd_la, cmd_ra, cmd_lh6, cmd_rh6, metrics = safe_physical_action(
+-                    raw22, prev_raw22, obs, jump_gate
++                    raw22, prev_raw22, obs
+                 )
+             except ValueError as e:
+ 

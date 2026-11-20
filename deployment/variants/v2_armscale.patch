@@ -1,0 +1,183 @@
+--- pir2.py
++++ pir2.py
+@@ -60,8 +60,8 @@
+ TRAINED_IMAGE_DELAY_MAX = 5
+ 
+ # Safety gates inherited from the trusted RGB controller.
+-RAW_ARM_GATE_DEG = 70.0
+-MAX_PRED_STEP_JUMP_DEG = 15.0
++RAW_ARM_GATE_DEG = 30.0
++MAX_PRED_STEP_JUMP_DEG = 8.0
+ MAX_ARM_STEP_DEG = 15.0
+ MAX_ARM_STEP_RAD = np.deg2rad(MAX_ARM_STEP_DEG)
+ MAX_HAND_STEP_RAD = 1.0
+@@ -368,6 +368,48 @@
+     return cmd_la, cmd_ra, cmd_lh6, cmd_rh6, metrics
+ 
+ 
++
++# =============================================================================
++# Arm command temporal scaling
++# =============================================================================
++
++def temporal_scale_arm(target, previous_command, measured, scale):
++    """
++    Slow only the arm command trajectory.
++
++    scale = 1.0:
++        identical to original V2.
++
++    scale < 1.0:
++        interpolate between the previously issued arm target and the
++        latest safe V2 arm target.
++
++    IMPORTANT:
++    - does NOT modify πR² inference
++    - does NOT modify d
++    - does NOT modify the hand command
++    - does NOT bypass any original safety gate
++    """
++
++    target = np.asarray(target, dtype=np.float64).reshape(7)
++    measured = np.asarray(measured, dtype=np.float64).reshape(7)
++
++    if previous_command is None:
++        previous_command = measured
++    else:
++        previous_command = np.asarray(
++            previous_command,
++            dtype=np.float64,
++        ).reshape(7)
++
++    command = (
++        previous_command
++        + float(scale) * (target - previous_command)
++    )
++
++    return np.ascontiguousarray(command)
++
++
+ # =============================================================================
+ # Main
+ # =============================================================================
+@@ -387,6 +429,18 @@
+     )
+     ap.add_argument("--nfe", type=int, default=DEFAULT_NFE)
+     ap.add_argument("--initial-d", type=int, default=DEFAULT_INITIAL_D)
++
++    ap.add_argument(
++        "--arm-speed-scale",
++        type=float,
++        default=1.0,
++        help=(
++            "Temporal scale for ARM commands only. "
++            "1.0 = original V2; 0.8/0.6/0.4 progressively slower. "
++            "Hands remain unchanged."
++        ),
++    )
++
+     ap.add_argument("--robot-host", required=True, help="Bridge address, e.g. 10.0.0.11")
+     ap.add_argument("--robot-port", type=int, default=7788)
+     ap.add_argument("--vlm-host", default="127.0.0.1")
+@@ -394,12 +448,16 @@
+     ap.add_argument("--dit-host", default="127.0.0.1")
+     ap.add_argument("--dit-port", type=int, default=5556)
+     ap.add_argument("--task", default="快递分拣")
+-    ap.add_argument("--cameras", choices=("rgb3", "head"), default="rgb3")
++    ap.add_argument("--cameras", choices=("rgb3",), default="rgb3")
+     args = ap.parse_args()
+     if not np.isfinite(args.seconds) or args.seconds < 0 or args.nfe < 1:
+         ap.error("seconds must be finite and nonnegative, nfe must be positive")
+-    jump_gate = MAX_PRED_STEP_JUMP_DEG if args.cameras == "rgb3" else 8.0
+     cameras = base.CAMERAS if args.cameras == "rgb3" else ("head_rgb",)
++
++    if not (0.0 < args.arm_speed_scale <= 1.0):
++        raise SystemExit(
++            "--arm-speed-scale must satisfy 0 < scale <= 1"
++        )
+ 
+     if not (1 <= args.initial_d <= TRAINED_D_MAX):
+         raise SystemExit(
+@@ -721,6 +779,17 @@
+     last_result_seq = 0
+     consecutive_rejects = 0
+ 
++    # Previous arm commands for temporal scaling.
++    # Hands deliberately have no corresponding state because their
++    # V2 command path is left completely unchanged.
++    prev_cmd_la = None
++    prev_cmd_ra = None
++
++    print(
++        f"[ARM_SCALE] arm_speed_scale={args.arm_speed_scale:.2f} | "
++        "hands unchanged"
++    )
++
+     print("\n[5] workers started")
+     print(f"initial emit window = [{chunk_idx}, {swap_target})")
+     print("\n[6] 20 Hz controller started")
+@@ -798,7 +867,7 @@
+                     raw22 = prev_raw22.copy()
+                     try:
+                         cmd_la, cmd_ra, cmd_lh6, cmd_rh6, metrics = safe_physical_action(
+-                            raw22, None, obs, jump_gate
++                            raw22, None, obs
+                         )
+                     except ValueError as e:
+                         consecutive_rejects += 1
+@@ -811,6 +880,23 @@
+                         continue
+ 
+                     consecutive_rejects = 0
++
++                    cmd_la = temporal_scale_arm(
++                        cmd_la,
++                        prev_cmd_la,
++                        obs["left_arm"],
++                        args.arm_speed_scale,
++                    )
++                    cmd_ra = temporal_scale_arm(
++                        cmd_ra,
++                        prev_cmd_ra,
++                        obs["right_arm"],
++                        args.arm_speed_scale,
++                    )
++
++                    prev_cmd_la = cmd_la.copy()
++                    prev_cmd_ra = cmd_ra.copy()
++
+                     if args.send:
+                         rpc = base.send_targets(
+                             cmd_proxy,
+@@ -864,7 +950,7 @@
+ 
+             try:
+                 cmd_la, cmd_ra, cmd_lh6, cmd_rh6, metrics = safe_physical_action(
+-                    raw22, prev_raw22, obs, jump_gate
++                    raw22, prev_raw22, obs
+                 )
+             except ValueError as e:
+ 
+@@ -902,6 +988,22 @@
+                 continue
+ 
+             consecutive_rejects = 0
++
++            cmd_la = temporal_scale_arm(
++                cmd_la,
++                prev_cmd_la,
++                obs["left_arm"],
++                args.arm_speed_scale,
++            )
++            cmd_ra = temporal_scale_arm(
++                cmd_ra,
++                prev_cmd_ra,
++                obs["right_arm"],
++                args.arm_speed_scale,
++            )
++
++            prev_cmd_la = cmd_la.copy()
++            prev_cmd_ra = cmd_ra.copy()
+ 
+             if args.send:
+                 rpc = base.send_targets(

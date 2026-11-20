@@ -1,0 +1,145 @@
+--- pir2.py
++++ pir2.py
+@@ -60,8 +60,8 @@
+ TRAINED_IMAGE_DELAY_MAX = 5
+ 
+ # Safety gates inherited from the trusted RGB controller.
+-RAW_ARM_GATE_DEG = 70.0
+-MAX_PRED_STEP_JUMP_DEG = 15.0
++RAW_ARM_GATE_DEG = 30.0
++MAX_PRED_STEP_JUMP_DEG = 8.0
+ MAX_ARM_STEP_DEG = 15.0
+ MAX_ARM_STEP_RAD = np.deg2rad(MAX_ARM_STEP_DEG)
+ MAX_HAND_STEP_RAD = 1.0
+@@ -394,11 +394,10 @@
+     ap.add_argument("--dit-host", default="127.0.0.1")
+     ap.add_argument("--dit-port", type=int, default=5556)
+     ap.add_argument("--task", default="快递分拣")
+-    ap.add_argument("--cameras", choices=("rgb3", "head"), default="rgb3")
++    ap.add_argument("--cameras", choices=("rgb3",), default="rgb3")
+     args = ap.parse_args()
+     if not np.isfinite(args.seconds) or args.seconds < 0 or args.nfe < 1:
+         ap.error("seconds must be finite and nonnegative, nfe must be positive")
+-    jump_gate = MAX_PRED_STEP_JUMP_DEG if args.cameras == "rgb3" else 8.0
+     cameras = base.CAMERAS if args.cameras == "rgb3" else ("head_rgb",)
+ 
+     if not (1 <= args.initial_d <= TRAINED_D_MAX):
+@@ -712,7 +711,6 @@
+ 
+     # πR² streaming calls produce a d-wide freshly cleaned region [d, 2d).
+     current_chunk = first_chunk
+-    current_info = seed_info if isinstance(seed_info, dict) else {}
+     current_d = int(args.initial_d)
+     chunk_idx = min(current_d, len(current_chunk) - 1)
+     swap_target = min(chunk_idx + current_d, len(current_chunk))
+@@ -772,11 +770,6 @@
+             if chunk_idx >= swap_target:
+                 if pending is not None and pending_seq > last_result_seq:
+                     current_chunk = pending["chunk"]
+-                    current_info = (
+-                        pending["info"]
+-                        if isinstance(pending.get("info"), dict)
+-                        else {}
+-                    )
+                     current_d = int(pending["d"])
+                     chunk_idx = min(current_d, len(current_chunk) - 1)
+                     swap_target = min(chunk_idx + current_d, len(current_chunk))
+@@ -798,7 +791,7 @@
+                     raw22 = prev_raw22.copy()
+                     try:
+                         cmd_la, cmd_ra, cmd_lh6, cmd_rh6, metrics = safe_physical_action(
+-                            raw22, None, obs, jump_gate
++                            raw22, None, obs
+                         )
+                     except ValueError as e:
+                         consecutive_rejects += 1
+@@ -830,75 +823,21 @@
+                         )
+                     continue
+ 
+-            current_img_delay_ticks = current_info.get(
+-                "image_delay_ticks"
+-            )
+-            current_img_delay_ms = current_info.get(
+-                "image_delay_ms"
+-            )
+-
+-            # Never execute a cached-VLM chunk outside the image-delay
+-            # range seen during training.
+-            if (
+-                args.send
+-                and current_img_delay_ticks is not None
+-                and float(current_img_delay_ticks)
+-                    > TRAINED_IMAGE_DELAY_MAX
+-            ):
+-                print(
+-                    f"[{step:05d}] WAIT stale_vlm | "
+-                    f"image_delay_ticks={current_img_delay_ticks} "
+-                    f"image_delay_ms={current_img_delay_ms}",
+-                    flush=True,
+-                )
+-
+-                # Abandon this stale emit window and wait for a newer
+-                # worker result instead of retrying the same action.
+-                chunk_idx = swap_target
+-                continue
+-
+-            raw22 = np.asarray(
+-                current_chunk[chunk_idx],
+-                dtype=np.float64,
+-            )
++            raw22 = np.asarray(current_chunk[chunk_idx], dtype=np.float64)
+ 
+             try:
+                 cmd_la, cmd_ra, cmd_lh6, cmd_rh6, metrics = safe_physical_action(
+-                    raw22, prev_raw22, obs, jump_gate
++                    raw22, prev_raw22, obs
+                 )
+             except ValueError as e:
+-
+-                # In DRY RUN the physical robot intentionally does not
+-                # follow predicted absolute actions. Therefore raw_arm
+-                # naturally grows as the predicted task trajectory moves
+-                # away from the stationary measured robot pose.
+-                #
+-                # Record and advance instead of repeatedly testing the
+-                # same rejected action three times.
+-                if not args.send:
+-                    print(
+-                        f"[{step:05d}] DRY_REJECT {e} | "
+-                        f"d={current_d} "
+-                        f"idx={chunk_idx}/{len(current_chunk)}"
+-                    )
+-
+-                    prev_raw22 = raw22.copy()
+-                    chunk_idx += 1
+-                    consecutive_rejects = 0
+-                    continue
+-
+                 consecutive_rejects += 1
+                 print(
+                     f"[{step:05d}] REJECT {e} | d={current_d} "
+                     f"idx={chunk_idx}/{len(current_chunk)} | "
+                     f"reject={consecutive_rejects}/{MAX_CONSECUTIVE_REJECTS}"
+                 )
+-
+                 if consecutive_rejects >= MAX_CONSECUTIVE_REJECTS:
+-                    raise RuntimeError(
+-                        "Safety stop: repeated action rejection"
+-                    )
+-
++                    raise RuntimeError("Safety stop: repeated action rejection")
+                 continue
+ 
+             consecutive_rejects = 0
+@@ -920,9 +859,7 @@
+             chunk_idx += 1
+ 
+             raw_d, clipped_d = measured_d()
+-            # Diagnostics MUST belong to the chunk currently emitted,
+-            # not to whatever newer result happens to be pending.
+-            info = current_info
++            info = pending["info"] if pending is not None else {}
+             img_delay_ticks = info.get("image_delay_ticks")
+             img_delay_ms = info.get("image_delay_ms")
+ 

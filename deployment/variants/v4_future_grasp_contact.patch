@@ -1,0 +1,496 @@
+--- pir2.py
++++ pir2.py
+@@ -60,13 +60,59 @@
+ TRAINED_IMAGE_DELAY_MAX = 5
+ 
+ # Safety gates inherited from the trusted RGB controller.
+-RAW_ARM_GATE_DEG = 70.0
+-MAX_PRED_STEP_JUMP_DEG = 15.0
++RAW_ARM_GATE_DEG = 30.0
++MAX_PRED_STEP_JUMP_DEG = 8.0
+ MAX_ARM_STEP_DEG = 15.0
+ MAX_ARM_STEP_RAD = np.deg2rad(MAX_ARM_STEP_DEG)
+ MAX_HAND_STEP_RAD = 1.0
+ MAX_CONSECUTIVE_REJECTS = 3
+ MAX_OBS_AGE_SEC = 0.15
++
++# ============================================================
++# Future-horizon grasp intent detector
++#
++# IMPORTANT:
++# Future actions are ONLY inspected for grasp intent.
++# They are NEVER sent to the robot.
++# Actual commands still come exclusively from πR²'s clean window.
++# ============================================================
++
++# current horizon + next 3 horizons = 4 t values
++PREGRASP_PREVIEW_POINTS = 4
++
++# Each consecutive horizon must move toward closing by at least this much.
++PREGRASP_MIN_T_STEP = 0.015
++
++# Total closing tendency across the preview window.
++PREGRASP_MIN_T_NET = 0.06
++
++# Require the same trend on two consecutive controller evaluations.
++PREGRASP_CONFIRM_TICKS = 2
++
++# Once the clean/current action itself starts requesting closure,
++# regard grasp execution as having actually started.
++PREGRASP_CURRENT_CLOSE_GAP = 0.04
++
++# Physical hand must catch the latest clean grasp target this closely
++# before the arm is released.
++# During real grasping, the object itself can prevent the physical
++# fingers from ever reaching the model's fully-closed target.
++#
++# Therefore do NOT require near-exact target tracking.
++# A grasp may be considered sufficiently closed when:
++#   1. physical t is already substantially closed, and
++#   2. it is within a contact-tolerant distance of the clean target.
++PREGRASP_RELEASE_GAP = 0.15
++PREGRASP_MIN_RELEASE_T = 0.80
++PREGRASP_RELEASE_TICKS = 3
++
++# If future grasp intent disappears before the real close command arrives,
++# cancel a false-positive pre-hold.
++PREGRASP_CANCEL_TICKS = 3
++
++# Never resume downward arm motion merely because of timeout.
++# Timeout -> safety stop.
++PREGRASP_TIMEOUT_SEC = 2.0
+ 
+ 
+ # =============================================================================
+@@ -366,6 +412,346 @@
+     }
+ 
+     return cmd_la, cmd_ra, cmd_lh6, cmd_rh6, metrics
++
++
++
++# =============================================================================
++# Future-horizon grasp intent guard
++# =============================================================================
++
++class FutureGraspGuard:
++    """
++    Detect an upcoming grasp from several FUTURE hand horizons.
++
++    Future horizons are only used as an intent signal.
++    No future action is ever directly sent.
++
++    State per hand:
++        NORMAL
++          |
++          | repeated monotonic future-t closing trend
++          v
++        PREGRASP_HOLD
++          - corresponding arm held at current measured pose
++          - hand still executes CURRENT clean πR² action
++          |
++          | current clean hand target really starts closing
++          v
++        GRASP_WAIT
++          - arm still held
++          - physical hand catches up
++          |
++          v
++        NORMAL
++    """
++
++    def __init__(self):
++        self.state = {
++            "left": self._new_state(),
++            "right": self._new_state(),
++        }
++
++    @staticmethod
++    def _new_state():
++        return {
++            "active": False,
++            "confirm": 0,
++            "cancel": 0,
++            "closing_started": False,
++            "release_count": 0,
++            "start_time": None,
++            "goal_t": 0.0,
++        }
++
++    @staticmethod
++    def _physical_t(side, obs):
++        hand6 = np.asarray(
++            obs[f"{side}_hand"],
++            dtype=np.float64,
++        ).reshape(6)
++
++        hand4 = base.compress_hand_6_to_4(hand6)
++        return hand4_to_gripper_t(hand4)
++
++    @staticmethod
++    def _current_target_t(side, raw22):
++        _, _, lh4, rh4 = split_action22(raw22)
++        h4 = lh4 if side == "left" else rh4
++        return hand4_to_gripper_t(h4)
++
++    @staticmethod
++    def _future_t_sequence(side, chunk, start_idx):
++        if chunk is None or start_idx is None:
++            return None
++
++        chunk = np.asarray(chunk, dtype=np.float64)
++
++        end_idx = start_idx + PREGRASP_PREVIEW_POINTS
++
++        if (
++            chunk.ndim != 2
++            or chunk.shape[1] != 22
++            or end_idx > len(chunk)
++        ):
++            return None
++
++        hand_slice = (
++            slice(14, 18)
++            if side == "left"
++            else slice(18, 22)
++        )
++
++        seq = []
++
++        for i in range(start_idx, end_idx):
++            h4 = chunk[i, hand_slice]
++            seq.append(hand4_to_gripper_t(h4))
++
++        return np.asarray(seq, dtype=np.float64)
++
++    @staticmethod
++    def _is_closing_trend(seq):
++        if seq is None or len(seq) < PREGRASP_PREVIEW_POINTS:
++            return False
++
++        diffs = np.diff(seq)
++
++        monotonic = bool(
++            np.all(diffs >= PREGRASP_MIN_T_STEP)
++        )
++
++        net = float(seq[-1] - seq[0])
++
++        return bool(
++            monotonic
++            and net >= PREGRASP_MIN_T_NET
++        )
++
++    def _apply_side(
++        self,
++        side,
++        raw22,
++        obs,
++        cmd_arm,
++        chunk,
++        chunk_idx,
++        step,
++        preview_available,
++    ):
++        st = self.state[side]
++
++        current_t = self._physical_t(side, obs)
++        target_t = self._current_target_t(side, raw22)
++
++        seq = None
++        trend = False
++
++        if preview_available:
++            seq = self._future_t_sequence(
++                side,
++                chunk,
++                chunk_idx,
++            )
++            trend = self._is_closing_trend(seq)
++
++        # ----------------------------------------------------
++        # NORMAL: look for repeated future closing trend
++        # ----------------------------------------------------
++        if not st["active"]:
++
++            if trend:
++                st["confirm"] += 1
++            elif preview_available:
++                st["confirm"] = 0
++
++            if st["confirm"] >= PREGRASP_CONFIRM_TICKS:
++                st["active"] = True
++                st["confirm"] = 0
++                st["cancel"] = 0
++                st["closing_started"] = False
++                st["release_count"] = 0
++                st["start_time"] = time.monotonic()
++                st["goal_t"] = current_t
++
++                seq_str = (
++                    np.array2string(
++                        seq,
++                        precision=3,
++                        separator=",",
++                    )
++                    if seq is not None
++                    else "n/a"
++                )
++
++                print(
++                    f"[PREGRASP] {side.upper()} ENTER | "
++                    f"future_t={seq_str} | "
++                    f"current_t={current_t:.3f} "
++                    f"target_t={target_t:.3f}",
++                    flush=True,
++                )
++
++        # ----------------------------------------------------
++        # PREGRASP HOLD / GRASP WAIT
++        # ----------------------------------------------------
++        if st["active"]:
++
++            # Has the CURRENT clean action actually begun
++            # commanding the hand to close?
++            clean_close_gap = float(
++                target_t - current_t
++            )
++
++            if (
++                not st["closing_started"]
++                and clean_close_gap
++                    >= PREGRASP_CURRENT_CLOSE_GAP
++            ):
++                st["closing_started"] = True
++                st["goal_t"] = max(
++                    st["goal_t"],
++                    target_t,
++                )
++                st["cancel"] = 0
++
++                print(
++                    f"[PREGRASP] {side.upper()} "
++                    f"CLOSE_START | "
++                    f"current_t={current_t:.3f} "
++                    f"target_t={target_t:.3f}",
++                    flush=True,
++                )
++
++            # Once real clean grasping begins, keep tracking the
++            # latest clean target. Never use future tail as goal.
++            if st["closing_started"]:
++                st["goal_t"] = max(
++                    st["goal_t"],
++                    target_t,
++                )
++
++                release_threshold = max(
++                    PREGRASP_MIN_RELEASE_T,
++                    st["goal_t"] - PREGRASP_RELEASE_GAP,
++                )
++
++                grasp_closed_enough = bool(
++                    current_t >= release_threshold
++                )
++
++                if grasp_closed_enough:
++                    st["release_count"] += 1
++                else:
++                    st["release_count"] = 0
++
++                if (
++                    st["release_count"]
++                    >= PREGRASP_RELEASE_TICKS
++                ):
++                    print(
++                        f"[PREGRASP] {side.upper()} EXIT_CONTACT | "
++                        f"current_t={current_t:.3f} "
++                        f"goal_t={st['goal_t']:.3f} "
++                        f"release_threshold={release_threshold:.3f}",
++                        flush=True,
++                    )
++
++                    self.state[side] = self._new_state()
++                    return cmd_arm
++
++            # Before a real close command appears, allow a
++            # false-positive future prediction to cancel itself.
++            else:
++                if preview_available:
++                    if trend:
++                        st["cancel"] = 0
++                    else:
++                        st["cancel"] += 1
++
++                if (
++                    st["cancel"]
++                    >= PREGRASP_CANCEL_TICKS
++                ):
++                    print(
++                        f"[PREGRASP] {side.upper()} CANCEL | "
++                        f"future intent disappeared",
++                        flush=True,
++                    )
++
++                    self.state[side] = self._new_state()
++                    return cmd_arm
++
++            # Safety timeout:
++            # do NOT release the arm and continue downward.
++            elapsed = (
++                time.monotonic() - st["start_time"]
++            )
++
++            if elapsed > PREGRASP_TIMEOUT_SEC:
++                raise RuntimeError(
++                    f"Safety stop: {side} pregrasp hold "
++                    f"timeout {elapsed:.2f}s | "
++                    f"closing_started={st['closing_started']} | "
++                    f"current_t={current_t:.3f} "
++                    f"target_t={target_t:.3f} "
++                    f"goal_t={st['goal_t']:.3f}"
++                )
++
++            # ------------------------------------------------
++            # ARM HOLD:
++            # hand command is deliberately untouched.
++            # ------------------------------------------------
++            cmd_arm = np.asarray(
++                obs[f"{side}_arm"],
++                dtype=np.float64,
++            ).copy()
++
++            if step % 10 == 0:
++                print(
++                    f"[PREGRASP] {side.upper()} HOLD | "
++                    f"closing={int(st['closing_started'])} | "
++                    f"current_t={current_t:.3f} "
++                    f"target_t={target_t:.3f} "
++                    f"goal_t={st['goal_t']:.3f}",
++                    flush=True,
++                )
++
++        return cmd_arm
++
++    def apply(
++        self,
++        raw22,
++        obs,
++        cmd_la,
++        cmd_ra,
++        chunk,
++        chunk_idx,
++        step,
++        preview_available=True,
++    ):
++        cmd_la = self._apply_side(
++            "left",
++            raw22,
++            obs,
++            cmd_la,
++            chunk,
++            chunk_idx,
++            step,
++            preview_available,
++        )
++
++        cmd_ra = self._apply_side(
++            "right",
++            raw22,
++            obs,
++            cmd_ra,
++            chunk,
++            chunk_idx,
++            step,
++            preview_available,
++        )
++
++        return cmd_la, cmd_ra
+ 
+ 
+ # =============================================================================
+@@ -394,11 +780,10 @@
+     ap.add_argument("--dit-host", default="127.0.0.1")
+     ap.add_argument("--dit-port", type=int, default=5556)
+     ap.add_argument("--task", default="快递分拣")
+-    ap.add_argument("--cameras", choices=("rgb3", "head"), default="rgb3")
++    ap.add_argument("--cameras", choices=("rgb3",), default="rgb3")
+     args = ap.parse_args()
+     if not np.isfinite(args.seconds) or args.seconds < 0 or args.nfe < 1:
+         ap.error("seconds must be finite and nonnegative, nfe must be positive")
+-    jump_gate = MAX_PRED_STEP_JUMP_DEG if args.cameras == "rgb3" else 8.0
+     cameras = base.CAMERAS if args.cameras == "rgb3" else ("head_rgb",)
+ 
+     if not (1 <= args.initial_d <= TRAINED_D_MAX):
+@@ -721,6 +1106,16 @@
+     last_result_seq = 0
+     consecutive_rejects = 0
+ 
++    future_grasp_guard = FutureGraspGuard()
++
++    print(
++        "[PREGRASP] enabled | "
++        f"points={PREGRASP_PREVIEW_POINTS} "
++        f"min_step={PREGRASP_MIN_T_STEP:.3f} "
++        f"min_net={PREGRASP_MIN_T_NET:.3f} "
++        f"confirm={PREGRASP_CONFIRM_TICKS}"
++    )
++
+     print("\n[5] workers started")
+     print(f"initial emit window = [{chunk_idx}, {swap_target})")
+     print("\n[6] 20 Hz controller started")
+@@ -798,7 +1193,7 @@
+                     raw22 = prev_raw22.copy()
+                     try:
+                         cmd_la, cmd_ra, cmd_lh6, cmd_rh6, metrics = safe_physical_action(
+-                            raw22, None, obs, jump_gate
++                            raw22, None, obs
+                         )
+                     except ValueError as e:
+                         consecutive_rejects += 1
+@@ -811,6 +1206,18 @@
+                         continue
+ 
+                     consecutive_rejects = 0
++
++                    cmd_la, cmd_ra = future_grasp_guard.apply(
++                        raw22=raw22,
++                        obs=obs,
++                        cmd_la=cmd_la,
++                        cmd_ra=cmd_ra,
++                        chunk=None,
++                        chunk_idx=None,
++                        step=step,
++                        preview_available=False,
++                    )
++
+                     if args.send:
+                         rpc = base.send_targets(
+                             cmd_proxy,
+@@ -864,7 +1271,7 @@
+ 
+             try:
+                 cmd_la, cmd_ra, cmd_lh6, cmd_rh6, metrics = safe_physical_action(
+-                    raw22, prev_raw22, obs, jump_gate
++                    raw22, prev_raw22, obs
+                 )
+             except ValueError as e:
+ 
+@@ -902,6 +1309,17 @@
+                 continue
+ 
+             consecutive_rejects = 0
++
++            cmd_la, cmd_ra = future_grasp_guard.apply(
++                raw22=raw22,
++                obs=obs,
++                cmd_la=cmd_la,
++                cmd_ra=cmd_ra,
++                chunk=current_chunk,
++                chunk_idx=chunk_idx,
++                step=step,
++                preview_available=True,
++            )
+ 
+             if args.send:
+                 rpc = base.send_targets(

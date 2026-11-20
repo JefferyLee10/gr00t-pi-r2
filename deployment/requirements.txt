@@ -1,0 +1,5 @@
+numpy==1.26.4
+opencv-python-headless==4.11.0.86
+Pyro5==5.17
+msgpack==1.1.0
+pyzmq==27.0.1
