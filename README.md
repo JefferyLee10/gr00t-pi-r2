@@ -49,22 +49,22 @@ python training/evaluate.py --checkpoint "$CKPT" --dataset data/processed/22d \
     --max-windows 1 --out outputs/validation.json
 ```
 
-**4. 启动 πR² 服务和控制器。** 每个终端都从仓库根目录激活上面的运行环境。前两个终端使用同一个微调 checkpoint。下面第 3 个终端使用录制帧启动回放桥，第 4 个终端运行控制器，两者均可在没有机器人的情况下联调。
+**4. 真机部署用三个终端。** 机器人端已有的桥接服务提供实时图像和关节状态。每个终端都从仓库根目录激活运行环境。前两个终端使用同一个微调 checkpoint；如果 5555 和 5556 已经就绪，直接执行终端 3 的命令。
 
 ```bash
-# 终端 1
+# 终端 1：VLM 视觉语言服务
 bash deployment/serve.sh outputs/rgb3_pir2/checkpoint-50000 0 5555
-# 终端 2
+# 终端 2：DiT 动作服务
 bash deployment/serve.sh outputs/rgb3_pir2/checkpoint-50000 1 5556
-# 终端 3
-python scripts/replay_bridge.py --dataset data/processed/28d --episode 0 --frame 0 --port 17788
-# 终端 4
-python deployment/pir2.py --cameras rgb3 --robot-host 127.0.0.1 --robot-port 17788 \
+# 终端 3：控制器连接现场机器人桥（请替换为自己的地址）
+python deployment/pir2.py --cameras rgb3 --robot-host 10.0.0.11 --robot-port 7788 \
     --vlm-host 127.0.0.1 --vlm-port 5555 --dit-host 127.0.0.1 --dit-port 5556 \
     --task "快递分拣" --seconds 10
 ```
 
 **换到真机时，请用自己的 IP 和端口。** 原实验机器人桥为 `10.0.0.11:7788`，替换控制器的 `--robot-host` 和 `--robot-port`。两个 `127.0.0.1` 指向控制器所在主机；若推理服务分布在其他机器，请分别设置 VLM、DiT 的服务端监听地址和客户端连接地址。控制器默认只读取观测并推理，确认关节顺序、单位和限幅后加 `--send` 才会下发动作。机器人端需有兼容的 Pyro5 桥和底层驱动。单头相机的部署参数是 `--cameras head`。完整参数、桥接口和标准 GR00T 基线在[部署指南](deployment/README.md)。
+
+**可选的无机器人回放。** 在没有现场机器人桥时，可以另开一个终端运行只读回放桥，让它用录制帧提供观测。此时控制器连接本机的 `127.0.0.1:17788`。四终端示例见[无机器人时复现控制链](deployment/README.md#无机器人时复现控制链)。
 
 ## 上游项目
 
